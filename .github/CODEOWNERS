@@ -1,0 +1,9 @@
+# Code owners for Declaratus/required-workflows.
+#
+# The workflows here run on every PR in every governed repo, so every
+# change needs code-owner review. The hard gate is the name-targeted
+# `repo-required-workflows` overlay ruleset in Declaratus/governance
+# (`rulesets/branch/repo-required-workflows.json`), which sets
+# `require_code_owner_review: true`.
+
+*                       @Barry-Johnston

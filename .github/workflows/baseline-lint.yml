@@ -1,0 +1,169 @@
+# This is an org-required reusable workflow. Source: Declaratus/required-workflows/.github/workflows/baseline-lint.yml. The rulesets that require it live in https://github.com/Declaratus/governance (spec 05).
+
+name: org/baseline-lint
+
+on:
+  # `pull_request` is the trigger the org ruleset `workflows` rule looks for —
+  # without one of {pull_request, pull_request_target, merge_queue}, the rule
+  # POST returns 422. Lint runs against untrusted PR content, so plain
+  # `pull_request` (no secrets, no write tokens) is the correct choice.
+  pull_request:
+  workflow_call:
+    inputs:
+      ruff-version:
+        description: "Pinned Ruff version for deterministic org-wide linting."
+        required: false
+        type: string
+        default: "0.6.9"
+      golangci-lint-version:
+        description: "Pinned golangci-lint version for deterministic org-wide linting."
+        required: false
+        type: string
+        default: "v2.14.0"
+
+permissions:
+  contents: read
+
+jobs:
+  baseline-lint:
+    name: org/baseline-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect languages
+        id: detect
+        run: |
+          # Check for Python indicators
+          if [[ -f pyproject.toml || -f setup.py ]]; then
+            echo "is_python=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_python=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Check for JavaScript/TypeScript indicators
+          if [[ -f package.json ]]; then
+            echo "is_js=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_js=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Check for Go indicators
+          if [[ -f go.mod ]]; then
+            echo "is_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Python linting
+        if: steps.detect.outputs.is_python == 'true'
+        env:
+          # inputs.* is only populated on workflow_call; on the ruleset's
+          # pull_request trigger it is empty, so fall back to the same pin.
+          RUFF_VERSION: ${{ inputs.ruff-version || '0.6.9' }}
+        run: |
+          pipx run --spec "ruff==${RUFF_VERSION}" ruff check .
+          pipx run --spec "ruff==${RUFF_VERSION}" ruff format --check .
+
+      - name: Setup Node.js
+        if: steps.detect.outputs.is_js == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: JavaScript/TypeScript dependencies
+        if: steps.detect.outputs.is_js == 'true'
+        id: js_deps
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then
+            npm ci
+            echo "deps_installed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+            echo "deps_installed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -f yarn.lock ]]; then
+            corepack enable
+            if [[ -f .yarnrc.yml ]]; then
+              yarn install --immutable
+            else
+              yarn install --frozen-lockfile
+            fi
+            echo "deps_installed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::warning::package.json found but no lockfile detected (package-lock.json / yarn.lock / pnpm-lock.yaml); skipping JS/TS linting"
+          echo "deps_installed=false" >> "$GITHUB_OUTPUT"
+
+      - name: JavaScript/TypeScript linting
+        if: steps.detect.outputs.is_js == 'true' && steps.js_deps.outputs.deps_installed == 'true'
+        run: |
+          # Check for eslint config (including package.json and flat config)
+          has_eslint_config=false
+          if compgen -G ".eslintrc*" > /dev/null 2>&1 || compgen -G "eslint.config.*" > /dev/null 2>&1; then
+            has_eslint_config=true
+          elif grep -Eq '"eslintConfig"[[:space:]]*:' package.json 2>/dev/null; then
+            has_eslint_config=true
+          fi
+
+          # Check for prettier config (including package.json)
+          has_prettier_config=false
+          if compgen -G ".prettierrc*" > /dev/null 2>&1 || compgen -G "prettier.config.*" > /dev/null 2>&1; then
+            has_prettier_config=true
+          elif grep -Eq '"prettier"[[:space:]]*:' package.json 2>/dev/null; then
+            has_prettier_config=true
+          fi
+
+          # Run eslint if config exists
+          if [[ $has_eslint_config == true ]]; then
+            if [[ -x node_modules/.bin/eslint ]]; then
+              node_modules/.bin/eslint .
+            elif npx --no-install eslint --version >/dev/null 2>&1; then
+              npx --no-install eslint .
+            else
+              echo "::warning::eslint not installed; skipping eslint"
+            fi
+          else
+            echo "::warning::No eslint configuration found; skipping eslint"
+          fi
+
+          # Run prettier if config exists
+          if [[ $has_prettier_config == true ]]; then
+            if [[ -x node_modules/.bin/prettier ]]; then
+              node_modules/.bin/prettier --check .
+            elif npx --no-install prettier --version >/dev/null 2>&1; then
+              npx --no-install prettier --check .
+            else
+              echo "::warning::prettier not installed; skipping prettier"
+            fi
+          else
+            echo "::warning::No prettier configuration found; skipping prettier"
+          fi
+
+      - name: Go linting
+        if: steps.detect.outputs.is_go == 'true'
+        # golangci-lint v2 needs golangci-lint-action v7 or later; v6 rejects a
+        # v2 version string, so unpinned it stays on golangci-lint v1. Same
+        # inputs.* fallback as Ruff: empty on the ruleset's pull_request trigger.
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ inputs.golangci-lint-version || 'v2.14.0' }}
+
+      - name: No linter configured fallback
+        if: |
+          steps.detect.outputs.is_python == 'false' &&
+          steps.detect.outputs.is_js == 'false' &&
+          steps.detect.outputs.is_go == 'false'
+        run: |
+          echo "No linter configured for this stack" >> "$GITHUB_STEP_SUMMARY"
+          exit 0

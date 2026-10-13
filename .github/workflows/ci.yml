@@ -1,0 +1,42 @@
+name: CI
+
+# Produces the `ci-summary` check the tier branch rulesets require on
+# every PR (see Declaratus/governance, rulesets/branch/*.json).
+#
+# actionlint is the meaningful PR-time gate: the workflows in this repo
+# run on every governed repo's PRs, and a typo here breaks those checks
+# org-wide as soon as it merges to main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: raven-actions/actionlint@v2
+
+  # Aggregate check that the org-level branch ruleset (spec 01) requires
+  # by name. `if: always()` is load-bearing: without it, a failed/skipped
+  # upstream leaves this job "skipped", which counts as a pass on a
+  # required check.
+  ci-summary:
+    name: ci-summary
+    needs: [actionlint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required jobs succeeded
+        run: |
+          actionlint_result='${{ needs.actionlint.result }}'
+          echo "actionlint=$actionlint_result"
+          if [ "$actionlint_result" != "success" ]; then
+            exit 1
+          fi
