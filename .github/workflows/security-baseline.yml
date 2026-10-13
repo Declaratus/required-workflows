@@ -1,0 +1,228 @@
+# This is an org-required reusable workflow. Source: Declaratus/required-workflows/.github/workflows/security-baseline.yml. The rulesets that require it live in https://github.com/Declaratus/governance (spec 05).
+
+name: org/security-baseline
+
+on:
+  # `pull_request` is the trigger the org ruleset `workflows` rule looks for —
+  # without one of {pull_request, pull_request_target, merge_queue}, the rule
+  # POST returns 422. Security checks run against untrusted PR content, so plain
+  # `pull_request` (no secrets, no write tokens) is the correct choice.
+  pull_request:
+  workflow_call:
+    inputs:
+      severity_threshold:
+        description: "Fail the workflow when findings are >= this severity."
+        required: false
+        type: string
+        default: critical
+
+# CodeQL is intentionally absent. GitHub rejects required (ruleset-injected)
+# workflows that reference github/codeql-action/* ("The following actions are
+# not allowed to be used inside a required workflow"), and the check is static
+# on the `uses:` references, so runtime if-guards don't help. Every injected
+# run of this file concluded startup_failure with zero jobs until the CodeQL
+# steps were removed. Code scanning stays per-repo, enforced by the ruleset
+# "code scanning results" rule where needed.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  security:
+    name: org/security-baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate severity threshold input
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          threshold="${{ inputs.severity_threshold || 'critical' }}"
+          case "$threshold" in
+            low|moderate|high|critical) ;;
+            *)
+              echo "::error::Invalid severity_threshold '$threshold' (expected one of: low, moderate, high, critical)"
+              exit 1
+              ;;
+          esac
+
+      - name: Detect dependency file changes
+        id: dep_changes
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const patterns = [
+              /(^|\/)package\.json$/,
+              /(^|\/)package-lock\.json$/,
+              /(^|\/)npm-shrinkwrap\.json$/,
+              /(^|\/)pnpm-lock\.yaml$/,
+              /(^|\/)yarn\.lock$/,
+              /(^|\/)requirements(\..+)?\.txt$/,
+              /(^|\/)pyproject\.toml$/,
+              /(^|\/)Pipfile$/,
+              /(^|\/)Pipfile\.lock$/,
+              /(^|\/)poetry\.lock$/,
+              /(^|\/)go\.mod$/,
+              /(^|\/)go\.sum$/,
+              /(^|\/)Cargo\.toml$/,
+              /(^|\/)Cargo\.lock$/,
+              /(^|\/)Gemfile$/,
+              /(^|\/)Gemfile\.lock$/,
+              /(^|\/)pom\.xml$/,
+              /(^|\/)build\.gradle(\.kts)?$/,
+              /(^|\/)gradle\.lockfile$/,
+            ];
+
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const changed = files.map((f) => f.filename);
+            const touched = changed.filter((name) => patterns.some((re) => re.test(name)));
+
+            core.setOutput("deps_changed", touched.length > 0 ? "true" : "false");
+            core.setOutput("touched", touched.join("\n"));
+
+      - name: Dependency review
+        if: steps.dep_changes.outputs.deps_changed == 'true'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: ${{ inputs.severity_threshold || 'critical' }}
+
+      - name: Detect Python
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Check for Python indicators
+          if [[ -f pyproject.toml || -f setup.py || -f requirements.txt ]]; then
+            is_python=true
+          else
+            is_python=false
+          fi
+          echo "is_python=$is_python" >> "$GITHUB_OUTPUT"
+
+      - name: Python dependency audit (pip-audit)
+        if: steps.detect.outputs.is_python == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          out_json="$RUNNER_TEMP/pip-audit.json"
+
+          if [[ -f requirements.txt ]]; then
+            audit_mode=(--requirement requirements.txt)
+          elif [[ -f uv.lock ]]; then
+            # pip-audit --locked only reads pylock.toml, not uv/poetry/pdm/Pipfile
+            # locks; export the uv lock to a pinned requirements file instead.
+            req_export="$RUNNER_TEMP/requirements-audit.txt"
+            pipx run uv export --frozen --no-emit-project --output-file "$req_export"
+            audit_mode=(--requirement "$req_export" --no-deps)
+          else
+            if [[ -f poetry.lock || -f Pipfile.lock || -f pdm.lock ]]; then
+              echo "::warning::pip-audit cannot read this lockfile format; auditing the resolved project instead"
+            else
+              echo "::warning::No requirements.txt or supported lockfile found; running pip-audit without --locked"
+            fi
+            audit_mode=(.)
+          fi
+
+          set +e
+          pipx run pip-audit "${audit_mode[@]}" --format json --vulnerability-service osv --output "$out_json"
+          audit_exit=$?
+          set -e
+
+          if [[ ! -s "$out_json" ]]; then
+            if [[ $audit_exit -ne 0 ]]; then
+              echo "::error::pip-audit failed (exit code $audit_exit) and produced no output"
+              exit 1
+            fi
+
+            echo "::warning::pip-audit produced no output; skipping Python dependency audit"
+            exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          threshold = os.environ.get("SEVERITY_THRESHOLD", "critical")
+          out_json = Path(os.environ["PIP_AUDIT_JSON"])
+
+          threshold_min = {
+              "low": 0.0,
+              "moderate": 4.0,
+              "high": 7.0,
+              "critical": 9.0,
+          }[threshold]
+
+          payload = json.loads(out_json.read_text(encoding="utf-8"))
+
+          # pip-audit >= 2.4 wraps output as {"dependencies": [...], "fixes": [...]};
+          # older releases emitted a bare list of dependency entries.
+          deps = payload.get("dependencies") or [] if isinstance(payload, dict) else payload
+
+          findings = []
+          unknown = 0
+
+          def score_for(vuln: dict) -> float | None:
+              best = None
+              for sev in vuln.get("severity") or []:
+                  raw = sev.get("score")
+                  if raw is None:
+                      continue
+                  try:
+                      val = float(raw)
+                  except (TypeError, ValueError):
+                      continue
+                  best = val if best is None else max(best, val)
+              return best
+
+          for dep in deps:
+              name = dep.get("name", "<unknown>")
+              version = dep.get("version") or "?"
+              for vuln in dep.get("vulns") or []:
+                  vid = vuln.get("id") or "<unknown>"
+                  score = score_for(vuln)
+                  if score is None:
+                      unknown += 1
+                      continue
+                  findings.append((score, f"{name}=={version} {vid} (CVSS {score})"))
+
+          failing = [line for score, line in findings if score >= threshold_min]
+
+          summary_lines = []
+          summary_lines.append(f"pip-audit findings (threshold: {threshold})")
+          summary_lines.append("")
+          if failing:
+              summary_lines.append(f"- Vulnerabilities at/above threshold: {len(failing)}")
+              for line in sorted(failing, reverse=True):
+                  summary_lines.append(f"  - {line}")
+          else:
+              summary_lines.append("- No vulnerabilities at/above threshold detected.")
+          if unknown:
+              summary_lines.append(f"- Warnings: {unknown} vulnerabilities had no severity score; not evaluated against threshold.")
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as fp:
+                  fp.write("\n".join(summary_lines) + "\n")
+          else:
+              print("\n".join(summary_lines))
+
+          if failing:
+              sys.exit(1)
+          PY
+        env:
+          SEVERITY_THRESHOLD: ${{ inputs.severity_threshold || 'critical' }}
+          PIP_AUDIT_JSON: ${{ runner.temp }}/pip-audit.json
